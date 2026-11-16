@@ -103,11 +103,23 @@ def _make_html(path):
                  '<body><p>Full text available to subscribers.</p></body></html>')
 
 
-def run(report_path: str) -> int:
+def _progress(report_path, report, note):
+    report.setdefault("progress", []).append("%s %s" % (time.strftime("%H:%M:%S"), note))
+    try:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, ensure_ascii=False, indent=1, default=str)
+    except Exception:
+        pass
+
+
+def run(report_path: str, timeout: int = 300) -> int:
     from . import analyzer, isolation, organizer, scanner
     from .capabilities import capabilities
 
-    report = {"capabilities": capabilities(deep=True), "checks": {}, "records": [], "error": None}
+    report = {"checks": {}, "records": [], "error": None}
+    _progress(report_path, report, "checking engines")
+    report["capabilities"] = capabilities(deep=True)
+    _progress(report_path, report, "engines checked")
     tmp = tempfile.mkdtemp(prefix="da_selftest_")
     ok = True
     try:
@@ -121,11 +133,12 @@ def run(report_path: str) -> int:
         with open(os.path.join(src, "song.mp3"), "wb") as fh:
             fh.write(b"ID3\x03\x00\x00\x00\x00\x00\x00")
 
-        worker = isolation.IsolatedAnalyzer(analyzer.Options(ml_mode="always"))
+        worker = isolation.IsolatedAnalyzer(analyzer.Options(ml_mode="always"), timeout=timeout)
         recs = []
         try:
             for r in scanner.scan(src):
                 t0 = time.monotonic()
+                _progress(report_path, report, "analyzing " + r.name)
                 r = worker.analyze(r)
                 r.extra["seconds"] = "%.1f" % (time.monotonic() - t0)
                 recs.append(r)

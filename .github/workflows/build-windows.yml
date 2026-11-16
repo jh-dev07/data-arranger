@@ -84,9 +84,23 @@ jobs:
 
       - name: Self-test the built exe
         shell: pwsh
+        timeout-minutes: 25
         run: |
-          $p = Start-Process -FilePath dist\DataArranger\DataArranger.exe -ArgumentList "--selftest", "$PWD\selftest_exe.json" -Wait -PassThru
-          Get-Content selftest_exe.json -Encoding UTF8
+          $log = Join-Path $env:TEMP "DataArranger\app.log"
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = (Resolve-Path dist\DataArranger\DataArranger.exe).Path
+          $psi.Arguments = "--selftest `"$PWD\selftest_exe.json`""
+          $psi.UseShellExecute = $false
+          $p = [System.Diagnostics.Process]::Start($psi)
+          $finished = $p.WaitForExit(20 * 60 * 1000)
+          if (-not $finished) { & taskkill /T /F /PID $p.Id | Out-Null }
+          Write-Host "===== self-test report ====="
+          if (Test-Path selftest_exe.json) { Get-Content selftest_exe.json -Encoding UTF8 }
+          Write-Host "===== app.log ====="
+          if (Test-Path $log) { Get-Content $log -Encoding UTF8 -Tail 200 }
+          Get-Process DataArranger -ErrorAction SilentlyContinue | Select-Object Id, StartTime, CPU
+          if (-not $finished) { throw "self-test of the built exe timed out" }
           if ($p.ExitCode -ne 0) { throw "self-test of the built exe failed (exit $($p.ExitCode))" }
 
       - name: Package
@@ -114,5 +128,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: selftest-reports
-          path: selftest_exe.json
+          path: |
+            selftest_exe.json
+            ${{ runner.temp }}/DataArranger/app.log
           if-no-files-found: ignore

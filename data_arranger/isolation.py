@@ -6,6 +6,7 @@ only cost its own analysis: the parent notices the crash or the time limit,
 restarts the worker, and records the file with a basic, name-based analysis
 instead. The worker keeps its models loaded between files.
 """
+import logging
 import multiprocessing
 import os
 import queue
@@ -19,6 +20,8 @@ from .models import CAT_DOCUMENT, FileRecord
 
 DEFAULT_TIMEOUT = 600   # seconds per file (OCR + model on a slow CPU)
 
+log = logging.getLogger(__name__)
+
 
 def _quiet_stdio():
     # A windowed .exe has no console; some libraries write progress bars.
@@ -30,17 +33,25 @@ def _quiet_stdio():
 
 def _worker_main(inq, outq, options):
     _quiet_stdio()
-    from . import ocr
+    from . import applog, ocr
+    applog.setup("worker")
+    log.info("worker started (ml=%s ocr=%s)", options.ml_mode, options.ocr)
     ocr.ENABLED = options.ocr
+    outq.put(("ready", None, None))
     while True:
         item = inq.get()
         if item is None:
+            log.info("worker exiting")
             return
         job_id, rec = item
+        t0 = time.monotonic()
+        log.info("job %s start: %s", job_id, rec.path)
         try:
             result = analyzer.analyze(rec, options=options)
+            log.info("job %s done in %.1fs", job_id, time.monotonic() - t0)
             outq.put((job_id, result, None))
         except BaseException:
+            log.exception("job %s failed", job_id)
             outq.put((job_id, rec, traceback.format_exc()[-1500:]))
 
 
@@ -76,6 +87,8 @@ class IsolatedAnalyzer:
         self.proc = self.ctx.Process(target=_worker_main,
                                      args=(self.inq, self.outq, self.options), daemon=True)
         self.proc.start()
+        log.info("started worker pid %s", self.proc.pid)
+        self.ready = False
 
     def _restart(self, crashed: bool = True):
         if crashed:
@@ -110,12 +123,19 @@ class IsolatedAnalyzer:
             try:
                 job_id, result, error = self.outq.get(timeout=0.5)
             except queue.Empty:
+                if not self.ready and time.monotonic() - started > 120:
+                    log.error("worker pid %s did not start within 120 s", self.proc.pid)
+                    self._restart()
+                    return basic_analysis(rec, "the analysis worker failed to start; "
+                                               "analysed from the file name")
                 if not self.proc.is_alive():
                     code = self.proc.exitcode
+                    log.error("worker crashed (exit %s) on %s", code, rec.path)
                     self._restart()
                     return basic_analysis(rec, "a library crashed while reading this file "
                                                "(exit code %s); analysed from the file name" % code)
                 if time.monotonic() - started > self.timeout:
+                    log.error("timeout after %ss on %s", self.timeout, rec.path)
                     self._restart()
                     return basic_analysis(rec, "reading this file took longer than %d s; "
                                                "analysed from the file name" % self.timeout)
@@ -123,6 +143,9 @@ class IsolatedAnalyzer:
                     self._restart(crashed=False)
                     rec.status = "Pending"
                     return rec
+                continue
+            if job_id == "ready":
+                self.ready = True
                 continue
             if job_id != job:
                 continue        # stale answer from before a restart

@@ -11,7 +11,17 @@ def _quiet_stdio():
 
 
 def main():
+    if any(a.startswith("--multiprocessing") for a in sys.argv[1:]):
+        # A worker process: hand over to multiprocessing, never start the GUI.
+        import multiprocessing
+        multiprocessing.freeze_support()
+        return 0
     _quiet_stdio()
+    from . import applog
+    applog.setup("app")
+    import logging
+    logging.getLogger(__name__).info("start %s frozen=%s argv=%s", sys.executable,
+                                     getattr(sys, "frozen", False), sys.argv[1:])
     if len(sys.argv) >= 2 and sys.argv[1] == "--selftest":
         from .selftest import run
         out = sys.argv[2] if len(sys.argv) > 2 else os.path.abspath("selftest_result.json")
