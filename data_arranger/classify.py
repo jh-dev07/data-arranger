@@ -89,7 +89,10 @@ def classify(rec: FileRecord, text: str) -> Tuple[str, float, List[str]]:
     if rec.issn or rec.extra.get("cn_serial"):
         add(JOURNAL, 3, "has ISSN/CN serial number")
     if rec.journal:
-        add(JOURNAL, 2, "journal name found")
+        src = rec.source_of("journal")
+        structured = any(s in src for s in ("HTML meta", "XML", "XMP", "Crossref"))
+        add(JOURNAL, 4 if structured else 2,
+            "journal named in embedded metadata" if structured else "journal name found")
     if rec.doi and (rec.journal or rec.issn):
         add(JOURNAL, 2, "DOI in a journal")
     if rec.volume and rec.issue:

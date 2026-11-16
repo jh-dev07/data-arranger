@@ -213,7 +213,8 @@ def review_reasons(rec: FileRecord, text_len: int) -> List[str]:
     out = []
     if rec.category != "Documents":
         return out
-    if text_len < 50:
+    trusted_title = any(s in rec.source_of("title") for s in _STRONG_SOURCES)
+    if text_len < 50 and not trusted_title:
         out.append("no readable text")
     if not rec.language:
         out.append("language unknown")
