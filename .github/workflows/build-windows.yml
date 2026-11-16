@@ -4,37 +4,115 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+env:
+  # Portable llama.cpp build: runs on any x86-64 CPU with AVX2 (2013+).
+  CMAKE_ARGS: "-DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DLLAMA_CURL=OFF"
+  FORCE_CMAKE: "1"
+  PYTHONIOENCODING: utf-8
+
 jobs:
   build:
     runs-on: windows-2022
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.8"
+          cache: pip
+
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: models-qwen25-1p5b-q4km-lid176-v1
+
+      - name: Download models
+        run: python download_models.py
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip wheel setuptools
           pip install -r requirements.txt "pyinstaller>=5.13,<6.10"
+          pip list
 
-      - name: Run tests
+      - name: Bundle helper tools (7-Zip for CHM, DjVuLibre for DjVu)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force tools\7z, tools\djvulibre | Out-Null
+          Copy-Item "C:\Program Files\7-Zip\7z.exe", "C:\Program Files\7-Zip\7z.dll" tools\7z\
+          $url = "https://sourceforge.net/projects/djvu/files/DjVuLibre_Windows/3.5.28%2B4.12/DjVuLibre-3.5.28_DjView-4.12_Setup.exe/download"
+          Invoke-WebRequest -Uri $url -OutFile djvu_setup.exe -UserAgent "Wget" -MaximumRedirection 10
+          & "C:\Program Files\7-Zip\7z.exe" x djvu_setup.exe -odjvu_x -y | Out-Null
+          $exe = Get-ChildItem djvu_x -Recurse -Filter ddjvu.exe | Select-Object -First 1
+          if (-not $exe) { throw "ddjvu.exe not found in DjVuLibre installer" }
+          $dir = $exe.DirectoryName
+          Copy-Item "$dir\*.dll" tools\djvulibre\
+          foreach ($t in "ddjvu.exe","djvused.exe","djvutxt.exe") { Copy-Item "$dir\$t" tools\djvulibre\ }
+          Get-ChildItem tools -Recurse | Select-Object FullName, Length
+
+      - name: Unit tests
         run: python -m unittest discover -s tests -v
 
-      - name: Check the GUI starts
-        shell: pwsh
+      - name: Full pipeline test (OCR + ML model, from source)
+        env:
+          DATA_ARRANGER_FULL: "1"
+        run: python -m unittest tests.test_full -v
+
+      - name: GUI starts
         env:
           QT_QPA_PLATFORM: offscreen
-        run: |
-          python -c "import sys; from PyQt5.QtWidgets import QApplication; app = QApplication(sys.argv); from data_arranger.gui.main_window import MainWindow; w = MainWindow(); w.show(); app.processEvents(); print('GUI OK')"
+        run: python -c "import sys; from PyQt5.QtWidgets import QApplication; app = QApplication(sys.argv); from data_arranger.gui.main_window import MainWindow; w = MainWindow(); w.show(); app.processEvents(); print('GUI OK', w.caps.text())"
 
       - name: Build exe
         run: >
           pyinstaller --noconfirm --clean --windowed --name DataArranger
-          --collect-data langdetect --collect-submodules hachoir run.py
+          --collect-all rapidocr_onnxruntime --collect-all llama_cpp
+          --collect-binaries onnxruntime --collect-data langdetect
+          --collect-submodules hachoir run.py
 
-      - uses: actions/upload-artifact@v4
+      - name: Add models and tools to the app folder
+        shell: pwsh
+        run: |
+          Copy-Item -Recurse models dist\DataArranger\models
+          Copy-Item -Recurse tools dist\DataArranger\tools
+          Copy-Item README.md dist\DataArranger\
+
+      - name: Self-test the built exe
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\DataArranger\DataArranger.exe -ArgumentList "--selftest", "$PWD\selftest_exe.json" -Wait -PassThru
+          Get-Content selftest_exe.json -Encoding UTF8
+          if ($p.ExitCode -ne 0) { throw "self-test of the built exe failed (exit $($p.ExitCode))" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          & "C:\Program Files\7-Zip\7z.exe" a -tzip -mx=5 DataArranger-windows.zip .\dist\DataArranger | Out-Null
+          Get-Item DataArranger-windows.zip | Select-Object Name, Length
+
+      - name: Publish release (latest build)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "latest-build"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --prerelease --title "Latest Windows build" --notes "Built from $env:GITHUB_SHA. Unzip and run DataArranger\DataArranger.exe."
+          } else {
+            gh release edit $tag --notes "Built from $env:GITHUB_SHA. Unzip and run DataArranger\DataArranger.exe."
+          }
+          gh release upload $tag DataArranger-windows.zip --clobber
+
+      - name: Keep self-test reports
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: DataArranger-windows
-          path: dist/DataArranger/
+          name: selftest-reports
+          path: selftest_exe.json
+          if-no-files-found: ignore

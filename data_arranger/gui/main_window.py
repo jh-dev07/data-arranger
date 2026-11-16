@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (QAbstractItemView, QAction, QButtonGroup, QCheckBox
                              QPushButton, QRadioButton, QScrollArea, QSplitter,
                              QTableView, QTabWidget, QVBoxLayout, QWidget)
 
-from .. import __version__, organizer
+from .. import __version__, analyzer, organizer
 from ..language import LANGUAGE_NAMES
 from ..models import (CAT_AUDIO, CAT_DOCUMENT, CAT_IMAGE, CAT_OTHER, CAT_VIDEO,
                       DOC_TYPES, FileRecord)
@@ -101,12 +101,14 @@ class DetailPanel(QWidget):
         self.doc_type.setCurrentText(rec.doc_type)
         self.doc_type.setEnabled(rec.category == CAT_DOCUMENT)
         self.language.setCurrentText(rec.language_name or "Unknown")
+        self.language.setEnabled(rec.category == CAT_DOCUMENT)
         for attr, w in self.edits.items():
             v = getattr(rec, attr)
             w.setText("; ".join(v) if isinstance(v, list) else (v or ""))
             w.setCursorPosition(0)
         self.abstract.setPlainText(rec.abstract)
         lines = [
+            ("Please check", ", ".join(rec.review) or "-"),
             ("Source", rec.path),
             ("Destination", rec.destination),
             ("Language detected from", rec.language_source or "-"),
@@ -146,9 +148,12 @@ class DetailPanel(QWidget):
                 rec.doc_type_confidence = 1.0
                 rec.doc_type_reasons = ["set by user"]
         lang_name = self.language.currentText().strip()
-        if lang_name != rec.language_name:
+        if rec.category == CAT_DOCUMENT and lang_name != rec.language_name:
             code = next((c for c, n in LANGUAGE_NAMES.items() if n == lang_name), "")
             rec.language, rec.language_name, rec.language_source = code, lang_name or "Unknown", "set by user"
+        rec.review = []
+        if rec.status == "Needs review":
+            rec.status = "Analyzed"
         if "edited by user" not in rec.metadata_sources:
             rec.metadata_sources.append("edited by user")
         self.on_save(rec)
@@ -228,6 +233,9 @@ class MainWindow(QMainWindow):
         self.progress.setMaximumWidth(360)
         self.progress.setTextVisible(True)
         self.status = QLabel("Choose a folder to begin.")
+        self.caps = QLabel(self._capabilities())
+        self.caps.setStyleSheet("color: gray")
+        bottom.addWidget(self.caps)
         bottom.addWidget(self.summary, 1)
         bottom.addWidget(self.status)
         bottom.addWidget(self.progress)
@@ -275,9 +283,17 @@ class MainWindow(QMainWindow):
         self.online_cb.setChecked(self.qs.value("online", False, type=bool))
         self.online_cb.setToolTip("Queries Crossref (DOI) and Open Library (ISBN) for accurate metadata.\n"
                                   "Only the identifier is sent. Applies to the next scan.")
+        self.ml_combo = QComboBox()
+        self.ml_combo.addItems(["ML model: always (most accurate)",
+                                "ML model: only when rules are unsure (faster)",
+                                "ML model: off (rules only, fastest)"])
+        self.ml_combo.setCurrentIndex(self.qs.value("ml_mode_index", 0, type=int))
+        self.ml_combo.setToolTip("The local ML model reads each document's first pages to extract "
+                                 "title, authors, journal, etc. and to classify the document type.\n"
+                                 "It runs offline on this PC; about 10-40 s per document.")
         layout_btn = QPushButton("Folder layout…")
         layout_btn.clicked.connect(self._edit_layout)
-        for w in (self.copy_rb, self.move_rb, self.rename_cb, self.online_cb):
+        for w in (self.copy_rb, self.move_rb, self.rename_cb, self.ml_combo, self.online_cb):
             opts.addWidget(w)
         opts.addStretch(1)
         opts.addWidget(layout_btn)
@@ -322,7 +338,11 @@ class MainWindow(QMainWindow):
         self.lang_combo.addItem("All languages")
         self.lang_combo.currentIndexChanged.connect(
             lambda i: self.proxy.set_filters(language="" if i <= 0 else self.lang_combo.currentText()))
+        self.review_cb = QCheckBox("Needs review only")
+        self.review_cb.setToolTip("Show only documents the app is unsure about")
+        self.review_cb.toggled.connect(lambda on: self.proxy.set_filters(review_only=on))
         row.addWidget(self.search, 1)
+        row.addWidget(self.review_cb)
         row.addWidget(self.cat_combo)
         row.addWidget(self.type_combo)
         row.addWidget(self.lang_combo)
@@ -371,6 +391,7 @@ class MainWindow(QMainWindow):
         self.qs.setValue("source", self.src_edit.text())
         self.qs.setValue("output", self.out_edit.text())
         self.qs.setValue("online", self.online_cb.isChecked())
+        self.qs.setValue("ml_mode_index", self.ml_combo.currentIndex())
 
     def _output_root(self):
         out = self.out_edit.text().strip()
@@ -460,7 +481,9 @@ class MainWindow(QMainWindow):
         self.lang_combo.addItem("All languages")
         self.lang_combo.blockSignals(False)
         self.logmsg("=== Scan: %s" % src)
-        w = ScanWorker(src, out, self.online_cb.isChecked(), self)
+        opts = analyzer.Options(online=self.online_cb.isChecked(),
+                                ml_mode=("always", "auto", "off")[self.ml_combo.currentIndex()])
+        w = ScanWorker(src, out, opts, self)
         w.progress.connect(self._on_progress)
         w.records.connect(self._on_records)
         w.message.connect(self._on_message)
@@ -520,6 +543,9 @@ class MainWindow(QMainWindow):
         langs = Counter(r.language_name for r in recs)
         parts = ["%d items" % len(recs)]
         parts.append(", ".join("%s %d" % kv for kv in cats.most_common()))
+        review = sum(1 for r in recs if r.review)
+        if review:
+            parts.append("%d need review" % review)
         if types:
             parts.append("Docs: " + ", ".join("%s %d" % kv for kv in types.most_common(4)))
         if langs:
@@ -654,6 +680,12 @@ class MainWindow(QMainWindow):
         self._update_summary()
         self.detail.show_record(rec)
         self.status.setText("Saved changes for %s" % rec.name)
+
+    def _capabilities(self) -> str:
+        from ..capabilities import capabilities
+        caps = capabilities()
+        self._missing = [n for n, ok in caps.items() if not ok]
+        return "  ".join(("✔ " if ok else "✘ ") + n for n, ok in caps.items())
 
     def _about(self):
         QMessageBox.about(self, APP, "<b>%s %s</b><p>Arranges documents, images, videos and audio "

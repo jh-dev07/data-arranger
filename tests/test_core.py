@@ -320,3 +320,75 @@ class OrganizerTests(TempDirCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CajRebuildTests(unittest.TestCase):
+    def test_rebuild_creates_page_tree_and_catalog(self):
+        body = (b"CAJ junk header\x00\x01"
+                b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>\nendobj\n"
+                b"4 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n"
+                b"5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>\nendobj\n")
+        out = cnki.rebuild_pdf(body)
+        self.assertTrue(out.startswith(b"%PDF-1.4"))
+        self.assertIn(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>", out)
+        self.assertIn(b"/Type /Catalog /Pages 2 0 R", out)
+        self.assertIn(b"trailer\n<< /Root 6 0 R", out)
+        self.assertTrue(out.rstrip().endswith(b"%%EOF"))
+
+
+class FusionTests(unittest.TestCase):
+    TEXT = ("Journal of Hearing Research Vol. 12, No. 3 (2019)\n"
+            "Deep Learning for Hearing Loss\nJohn Smith, Jane Doe\n"
+            "Abstract We propose a network that classifies audiograms with high accuracy "
+            "on three public datasets and several clinics.\nKeywords: audiology\n")
+
+    def test_ml_values_must_be_in_text(self):
+        from data_arranger import fusion
+        rec = FileRecord(path="a.pdf", rel_path="a.pdf", ext="pdf", category="Documents")
+        rec.set_if_empty("title", "a", "file name")
+        fusion.merge(rec, {
+            "doc_type": "Journal Article",
+            "title": "Deep Learning for Hearing Loss",
+            "authors": ["John Smith", "Invented Person"],
+            "journal": "Journal of Hearing Research",
+            "publisher": "Made Up Press",              # not in text -> rejected
+            "isbn": "9780306406157",                   # valid checksum but not in text
+            "publish_date": "2019", "volume": "12", "issue": "3",
+            "abstract_start": "We propose a network that classifies audiograms",
+            "keywords": ["audiology", "hallucinated"],
+        }, self.TEXT)
+        self.assertEqual(rec.title, "Deep Learning for Hearing Loss")
+        self.assertEqual(rec.authors, [])          # only 1 of 2 verified (< 60%)
+        self.assertEqual(rec.journal, "Journal of Hearing Research")
+        self.assertEqual(rec.publisher, "")
+        self.assertEqual(rec.isbn, "")
+        self.assertEqual(rec.keywords, ["audiology"])
+        self.assertTrue(rec.abstract.startswith("We propose a network"))
+        self.assertEqual(rec.extra["type_from_llm"], "Journal Article")
+
+    def test_ocr_noise_tolerated(self):
+        from data_arranger import fusion
+        t = fusion.norm("Deep Leaming for Hearinq Loss in Chi1dren")
+        self.assertTrue(fusion.in_text("Deep Learning for Hearing Loss in Children", t))
+
+
+class IsolationTests(TempDirCase):
+    def test_worker_process_roundtrip_and_fallback(self):
+        from data_arranger import analyzer, isolation
+        make_docx(os.path.join(self.tmp, "r.docx"), "Annual Water Quality Report", "A. Smith",
+                  "The annual report of the water quality in the region is presented here "
+                  "for the year and the trends are discussed in detail by the authors.")
+        rec = next(scanner.scan(self.tmp))
+        w = isolation.IsolatedAnalyzer(analyzer.Options(ml_mode="off"), timeout=60)
+        try:
+            out = w.analyze(rec)
+        finally:
+            w.close()
+        self.assertEqual(out.title, "Annual Water Quality Report")
+        self.assertEqual(out.language, "en")
+
+        rec2 = FileRecord(path=os.path.join(self.tmp, "论文_张三.caj"), rel_path="论文_张三.caj",
+                          ext="caj", category="Documents")
+        isolation.basic_analysis(rec2, "simulated crash")
+        self.assertEqual(rec2.status, "Needs review")
+        self.assertIn("content could not be read", rec2.review)

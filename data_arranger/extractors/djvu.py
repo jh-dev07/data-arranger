@@ -5,11 +5,11 @@ used for metadata and the hidden text layer. Otherwise the IFF structure is
 read directly for the page count and any uncompressed annotation/text chunks.
 """
 import re
-import shutil
 import struct
 import subprocess
 import sys
 
+from .. import ocr, paths
 from ..models import FileRecord
 from .common import clean_text
 
@@ -50,13 +50,65 @@ def _iff_scan(path: str, rec: FileRecord) -> str:
             texts.append(body.decode("utf-8", "ignore"))
         if sum(len(t) for t in texts) > 60000:
             break
-    if not texts:
-        rec.notes.append("DjVu text layer is compressed or absent; install DjVuLibre to read it")
+    return "\n".join(texts)
+
+
+def _ocr_pages(rec: FileRecord) -> str:
+    ddjvu = paths.tool("ddjvu")
+    if not ddjvu:
+        rec.notes.append("DjVu pages are images; DjVuLibre (ddjvu) is needed to OCR them")
+        return ""
+    if not ocr.available():
+        rec.notes.append("OCR unavailable: " + ocr.unavailable_reason())
+        return ""
+    import os
+    import tempfile
+    from PIL import Image
+    texts = []
+    last = min(rec.pages or 3, 3)
+    pages = list(range(1, last + 1))
+    if rec.pages and rec.pages > 3:
+        pages.append(rec.pages)
+    for n in pages:
+        fd, tif = tempfile.mkstemp(suffix=".tif", dir=paths.work_dir())
+        os.close(fd)
+        try:
+            subprocess.run([ddjvu, "-format=tiff", "-page=%d" % n, "-scale=150", rec.path, tif],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=120, creationflags=_NO_WINDOW)
+            if os.path.getsize(tif) == 0:
+                continue
+            with Image.open(tif) as im:
+                im.load()
+                lines = ocr.ocr_lines(im.convert("RGB"))
+            if n == 1 and lines:
+                t = ocr.title_from_lines(lines)
+                if t:
+                    rec.extra.setdefault("layout_title", t)
+            texts.append(ocr.lines_to_text(lines))
+        except Exception as exc:
+            rec.notes.append("DjVu page %d OCR failed: %s" % (n, exc.__class__.__name__))
+        finally:
+            try:
+                os.remove(tif)
+            except OSError:
+                pass
+    if any(t.strip() for t in texts):
+        rec.extra["ocr_pages"] = str(len(texts))
+        if "OCR" not in rec.metadata_sources:
+            rec.metadata_sources.append("OCR")
     return "\n".join(texts)
 
 
 def extract(rec: FileRecord) -> str:
-    djvused = shutil.which("djvused")
+    text = _extract_text(rec)
+    if len(text.strip()) < 100:
+        text = text + "\n" + _ocr_pages(rec)
+    return clean_text(text)
+
+
+def _extract_text(rec: FileRecord) -> str:
+    djvused = paths.tool("djvused")
     if djvused:
         n = _run([djvused, "-e", "n", rec.path]).strip()
         if n.isdigit():
@@ -70,7 +122,7 @@ def extract(rec: FileRecord) -> str:
         rec.set_if_empty("publisher", fields.get("publisher", ""), src)
         rec.set_if_empty("publish_date", fields.get("year", ""), src)
         rec.set_if_empty("isbn", re.sub(r"[^\dX]", "", fields.get("isbn", "").upper()), src)
-        djvutxt = shutil.which("djvutxt")
+        djvutxt = paths.tool("djvutxt")
         if djvutxt:
             last = min(rec.pages or 5, 5)
             text = _run([djvutxt, "--page=1-%d" % last, rec.path], timeout=60)

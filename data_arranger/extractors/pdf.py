@@ -1,151 +1,183 @@
-"""PDF metadata and text: document info dictionary, XMP packet, and the
-first pages' text (used for language, abstract, identifiers and title)."""
+"""PDF (and PDFs recovered from KDH/CAJ) via PyMuPDF.
+
+Reads the info dictionary, the XMP packet and the text of the first pages.
+Pages without a usable text layer (scans, image-only PDFs, broken font
+encodings) are rendered and OCR'd. The title is taken from the largest font
+on page 1 (or the largest OCR glyphs) when embedded metadata has none.
+"""
 import io
-import logging
-import math
 import re
 from typing import List
 
+from .. import ocr
 from ..models import FileRecord
-from ..textmeta import plausible_title, title_from_font_spans
+from ..textmeta import plausible_title
 from .common import clean_text, split_author_field, xml_unescape
 
 try:
-    from pypdf import PdfReader
-    _HAVE_PYPDF = True
+    import fitz  # PyMuPDF
+    fitz.TOOLS.mupdf_display_errors(False)
+    _HAVE_FITZ = True
 except Exception:  # pragma: no cover
-    _HAVE_PYPDF = False
+    _HAVE_FITZ = False
 
-logging.getLogger("pypdf").setLevel(logging.ERROR)
-
-TEXT_PAGES = 4          # pages read from the front for text analysis
+FRONT_PAGES = 4         # pages read from the front
+OCR_ZOOM = 2.0          # 144 dpi; enough for body text, fast on CPU
 
 
 def extract(rec: FileRecord) -> str:
-    with open(rec.path, "rb") as fh:
-        return extract_stream(rec, fh, "PDF")
+    if not _HAVE_FITZ:
+        rec.notes.append("PyMuPDF missing; PDF content not read")
+        return ""
+    doc = fitz.open(rec.path)
+    try:
+        return analyze_document(rec, doc, "PDF")
+    finally:
+        doc.close()
 
 
 def extract_bytes(rec: FileRecord, data: bytes, label: str) -> str:
-    return extract_stream(rec, io.BytesIO(data), label)
-
-
-def extract_stream(rec: FileRecord, stream, label: str) -> str:
-    if not _HAVE_PYPDF:
-        rec.notes.append("pypdf not installed; PDF content not read")
-        return ""
-    reader = PdfReader(stream, strict=False)
-    if reader.is_encrypted:
-        try:
-            if not reader.decrypt(""):
-                rec.notes.append("PDF is password-protected")
-                return ""
-        except Exception:
-            rec.notes.append("PDF is encrypted with an unsupported method")
-            return ""
-
+    doc = fitz.open(stream=data, filetype="pdf")
     try:
-        rec.pages = len(reader.pages)
+        if doc.page_count == 0:
+            raise ValueError("no pages")
+        return analyze_document(rec, doc, label)
+    finally:
+        doc.close()
+
+
+def _usable(text: str) -> bool:
+    t = text.strip()
+    if len(t) < 40:
+        return False
+    bad = sum(1 for ch in t if ch == "�" or 0xE000 <= ord(ch) <= 0xF8FF or ord(ch) < 9)
+    letters = sum(1 for ch in t if ch.isalpha())
+    return bad < len(t) * 0.1 and letters > len(t) * 0.3
+
+
+def render_page(page, zoom: float = OCR_ZOOM):
+    from PIL import Image
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    mode = "RGB" if pix.n >= 3 else "L"
+    return Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+
+
+def analyze_document(rec: FileRecord, doc, label: str) -> str:
+    if doc.needs_pass and not doc.authenticate(""):
+        rec.notes.append("PDF is password-protected; only the file name was used")
+        return ""
+    rec.pages = doc.page_count
+    _read_info(rec, doc.metadata or {}, label)
+    try:
+        _read_xmp(rec, doc.get_xml_metadata() or "", label)
     except Exception:
         pass
 
-    _read_info(rec, reader, label)
-    _read_xmp(rec, reader, label)
+    pages = list(range(min(FRONT_PAGES, doc.page_count)))
+    if doc.page_count > FRONT_PAGES:
+        pages.append(doc.page_count - 1)   # books: imprint/ISBN often at the back
 
     texts = []
-    spans = []
-    n = min(TEXT_PAGES, rec.pages or 0)
-    for i in range(n):
-        page = reader.pages[i]
-        if i == 0:
-            order = [0]
-
-            def visitor(text, cm, tm, font_dict, font_size, _o=order):
-                if not text or not text.strip():
-                    return
-                try:
-                    scale = math.hypot(tm[2], tm[3]) * math.hypot(cm[2], cm[3])
-                except Exception:
-                    scale = 1.0
-                size = (font_size or 0) * (scale or 1.0)
-                spans.append((text, size, _o[0]))
-                _o[0] += 1
-            try:
-                texts.append(page.extract_text(visitor_text=visitor) or "")
-            except Exception:
-                texts.append("")
+    ocr_pages = 0
+    layout_title = ""
+    for i in pages:
+        page = doc.load_page(i)
+        text = page.get_text("text") or ""
+        if _usable(text):
+            if i == 0:
+                layout_title = _title_from_spans(page)
         else:
-            try:
-                texts.append(page.extract_text() or "")
-            except Exception:
-                texts.append("")
-    # The last page of books often carries the CIP/ISBN/imprint data.
-    if rec.pages and rec.pages > n:
-        try:
-            texts.append(reader.pages[rec.pages - 1].extract_text() or "")
-        except Exception:
-            pass
+            lines = _ocr_page(rec, page)
+            if lines:
+                ocr_pages += 1
+                text = ocr.lines_to_text(lines)
+                if i == 0:
+                    layout_title = ocr.title_from_lines(lines, page.rect.height * OCR_ZOOM)
+        texts.append(text)
+    if ocr_pages:
+        rec.extra["ocr_pages"] = str(ocr_pages)
+        if "OCR" not in rec.metadata_sources:
+            rec.metadata_sources.append("OCR")
 
+    if layout_title and plausible_title(layout_title):
+        rec.extra["layout_title"] = layout_title[:300]
+        if not rec.title:
+            rec.set_if_empty("title", layout_title, "PDF layout")
     text = clean_text("\n".join(texts))
-    if len(text.strip()) < 50:
-        rec.notes.append("No text layer (scanned/image PDF); OCR is not performed")
-    elif not rec.title or not plausible_title(rec.title):
-        t = title_from_font_spans(spans[:400])
-        if t:
-            rec.title = ""
-            rec.set_if_empty("title", t, "PDF layout")
+    if not text.strip():
+        rec.notes.append("no text found on the first pages, even with OCR")
     return text
 
 
-def _s(v) -> str:
-    if v is None:
-        return ""
+def _ocr_page(rec: FileRecord, page):
+    if not ocr.available():
+        if "OCR unavailable" not in " ".join(rec.notes):
+            rec.notes.append("OCR unavailable: " + ocr.unavailable_reason())
+        return []
     try:
-        return str(v).strip().strip("\x00")
-    except Exception:
-        return ""
+        return ocr.ocr_lines(render_page(page))
+    except Exception as exc:
+        rec.notes.append("OCR failed on page %d: %s" % (page.number + 1, exc.__class__.__name__))
+        return []
 
 
-def _read_info(rec: FileRecord, reader, label: str) -> None:
+def _title_from_spans(page) -> str:
     try:
-        info = reader.metadata or {}
+        d = page.get_text("dict")
     except Exception:
-        return
+        return ""
+    height = page.rect.height or 1
+    rows = []   # (size, top, text)
+    for block in d.get("blocks", []):
+        for line in block.get("lines", []):
+            spans = [s for s in line.get("spans", []) if s.get("text", "").strip()]
+            if not spans:
+                continue
+            size = max(s.get("size", 0) for s in spans)
+            top = line.get("bbox", [0, 0, 0, 0])[1]
+            rows.append((size, top, "".join(s["text"] for s in spans).strip()))
+    rows = [r for r in rows if r[1] < height * 0.6 and len(r[2]) >= 2]
+    if not rows:
+        return ""
+    for size in sorted({round(r[0], 1) for r in rows}, reverse=True)[:3]:
+        block = sorted((r for r in rows if round(r[0], 1) >= size - 0.05), key=lambda r: r[1])
+        # consecutive lines only
+        picked = [block[0]]
+        for r in block[1:]:
+            if r[1] - picked[-1][1] <= size * 2.2:
+                picked.append(r)
+            else:
+                break
+        cand = " ".join(r[2] for r in picked)
+        cand = re.sub(r"\s+", " ", cand).strip()
+        if plausible_title(cand) and len(cand) >= 6:
+            return cand
+    return ""
+
+
+def _read_info(rec: FileRecord, info, label: str) -> None:
     src = label + " info"
-    title = _s(info.get("/Title"))
+    title = (info.get("title") or "").strip()
     if plausible_title(title):
+        rec.extra["embedded_title"] = title
         rec.set_if_empty("title", title, src)
-    rec.set_if_empty("authors", split_author_field(_s(info.get("/Author"))), src)
-    kw = _s(info.get("/Keywords"))
+    rec.set_if_empty("authors", split_author_field(info.get("author") or ""), src)
+    kw = (info.get("keywords") or "").strip()
     if kw:
         rec.set_if_empty("keywords", [k.strip() for k in re.split(r"[;,，；、]", kw) if k.strip()], src)
-    subject = _s(info.get("/Subject"))
+    subject = (info.get("subject") or "").strip()
     if subject:
-        # Publishers often put "Journal, Vol, pages. doi:..." in Subject.
         rec.extra.setdefault("pdf_subject", subject[:500])
         if len(subject) > 200:
             rec.set_if_empty("abstract", subject, src)
-    for key, name in (("/Creator", "creator_app"), ("/Producer", "producer"),
-                      ("/CreationDate", "file_created")):
-        v = _s(info.get(key))
+    for key, name in (("creator", "creator_app"), ("producer", "producer"),
+                      ("creationDate", "file_created")):
+        v = (info.get(key) or "").strip()
         if v:
             rec.extra.setdefault(name, v[:120])
 
 
-def _xmp_raw(reader) -> str:
-    try:
-        root = reader.trailer["/Root"]
-        meta = root.get("/Metadata")
-        if meta is None:
-            return ""
-        data = meta.get_object().get_data()
-        return data.decode("utf-8", "ignore")
-    except Exception:
-        return ""
-
-
 def _xmp_values(xmp: str, tag: str) -> List[str]:
-    # Either <tag>value</tag>, <tag><rdf:Seq><rdf:li>v</rdf:li>..., or tag="value"
     out = []
     m = re.search(r"<%s\b[^>]*>(.*?)</%s>" % (re.escape(tag), re.escape(tag)), xmp, re.S)
     if m:
@@ -159,8 +191,7 @@ def _xmp_values(xmp: str, tag: str) -> List[str]:
     return [xml_unescape(re.sub(r"<[^>]+>", "", v)).strip() for v in out if v.strip()]
 
 
-def _read_xmp(rec: FileRecord, reader, label: str) -> None:
-    xmp = _xmp_raw(reader)
+def _read_xmp(rec: FileRecord, xmp: str, label: str) -> None:
     if not xmp:
         return
     src = label + " XMP"
@@ -174,6 +205,7 @@ def _read_xmp(rec: FileRecord, reader, label: str) -> None:
 
     title = first("dc:title")
     if plausible_title(title):
+        rec.extra.setdefault("embedded_title", title)
         rec.set_if_empty("title", title, src)
     creators = _xmp_values(xmp, "dc:creator")
     if len(creators) == 1:
@@ -183,18 +215,23 @@ def _read_xmp(rec: FileRecord, reader, label: str) -> None:
     desc = first("dc:description")
     if len(desc) > 150:
         rec.set_if_empty("abstract", desc, src)
-    rec.set_if_empty("doi", first("prism:doi", "pdfx:doi", "crossmark:DOI").replace("doi:", ""), src)
+    rec.set_if_empty("doi", re.sub(r"^(?:doi:|https?://(?:dx\.)?doi\.org/)", "",
+                                   first("prism:doi", "pdfx:doi", "crossmark:DOI")), src)
     rec.set_if_empty("journal", first("prism:publicationName"), src)
     rec.set_if_empty("volume", first("prism:volume"), src)
     rec.set_if_empty("issue", first("prism:number", "prism:issueIdentifier"), src)
     rec.set_if_empty("issn", first("prism:issn", "prism:eIssn"), src)
-    isbn = re.sub(r"[^\dX]", "", first("prism:isbn").upper())
-    rec.set_if_empty("isbn", isbn, src)
+    rec.set_if_empty("isbn", re.sub(r"[^\dX]", "", first("prism:isbn").upper()), src)
     rec.set_if_empty("publisher", first("dc:publisher"), src)
-    rec.set_if_empty("publish_date", first("prism:coverDate", "prism:publicationDate", "dc:date"), src)
+    rec.set_if_empty("publish_date", first("prism:coverDate", "prism:publicationDate"), src)
     lang = first("dc:language")
     if lang:
         rec.extra.setdefault("language_tag", lang)
     agg = first("prism:aggregationType")
     if agg:
         rec.extra.setdefault("prism_type", agg)
+
+
+def open_any(data: bytes):
+    """Open bytes with MuPDF, which repairs broken cross-reference tables."""
+    return fitz.open(stream=io.BytesIO(data).getvalue(), filetype="pdf")

@@ -129,6 +129,9 @@ def classify(rec: FileRecord, text: str) -> Tuple[str, float, List[str]]:
     authoritative = rec.extra.get("type_from_lookup")
     if authoritative:
         add(authoritative, 10, "online catalog record")
+    llm_type = rec.extra.get("type_from_llm")
+    if llm_type:
+        add(llm_type, 5, "ML model reading the document")
 
     if not scores:
         return OTHER_DOC, 0.0, []

@@ -5,6 +5,8 @@ import traceback
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from .. import analyzer, organizer, scanner
+from ..isolation import IsolatedAnalyzer
+from ..models import CAT_DOCUMENT
 
 
 class ScanWorker(QThread):
@@ -13,9 +15,9 @@ class ScanWorker(QThread):
     message = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, root, exclude, online, parent=None):
+    def __init__(self, root, exclude, options, parent=None):
         super().__init__(parent)
-        self.root, self.exclude, self.online = root, exclude, online
+        self.root, self.exclude, self.options = root, exclude, options
         self._stop = False
 
     def stop(self):
@@ -30,18 +32,33 @@ class ScanWorker(QThread):
                 if len(items) % 500 == 0:
                     self.progress.emit(0, 0, "found %d files" % len(items))
             total = len(items)
-            self.message.emit("Found %d items. Analyzing..." % total)
+            docs = sum(1 for r in items if r.category == CAT_DOCUMENT)
+            self.message.emit("Found %d items (%d documents). Analyzing... the first document "
+                              "takes longer while the OCR and ML models load." % (total, docs))
+            worker = IsolatedAnalyzer(self.options)
             batch, last = [], time.monotonic()
-            for i, rec in enumerate(items):
-                if self._stop:
-                    self.message.emit("Scan stopped by user after %d of %d items." % (i, total))
-                    break
-                self.progress.emit(i, total, rec.rel_path)
-                analyzer.analyze(rec, online=self.online)
-                batch.append(rec)
-                if len(batch) >= 25 or time.monotonic() - last > 0.3:
-                    self.records.emit(batch)
-                    batch, last = [], time.monotonic()
+            started = time.monotonic()
+            try:
+                for i, rec in enumerate(items):
+                    if self._stop:
+                        self.message.emit("Scan stopped by user after %d of %d items." % (i, total))
+                        break
+                    eta = ""
+                    if i >= 3:
+                        per = (time.monotonic() - started) / i
+                        rem = int(per * (total - i))
+                        eta = "  (~%d min left)" % (rem // 60 + 1) if rem > 60 else ""
+                    self.progress.emit(i, total, rec.rel_path + eta)
+                    rec = worker.analyze(rec, cancelled=lambda: self._stop)
+                    items[i] = rec
+                    if rec.status == "Pending":        # cancelled mid-file
+                        continue
+                    batch.append(rec)
+                    if len(batch) >= 10 or time.monotonic() - last > 0.5:
+                        self.records.emit(batch)
+                        batch, last = [], time.monotonic()
+            finally:
+                worker.close()
             if batch:
                 self.records.emit(batch)
             self.progress.emit(total, total, "")

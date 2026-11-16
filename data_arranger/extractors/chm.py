@@ -1,13 +1,22 @@
 """Compiled HTML Help (.chm): title and language from the ITSF container.
 
 The CHM directory and the #SYSTEM file are stored uncompressed, so the title
-and Windows LCID can be read without an LZX decompressor. Page text is
-LZX-compressed and is not decoded; language comes from the LCID and title.
+and Windows LCID are read directly. Page text is LZX-compressed; it is
+extracted with the bundled 7-Zip (or Windows' hh.exe) into a temp folder.
 """
+import os
+import shutil
 import struct
+import subprocess
+import sys
+import tempfile
 
+from .. import paths
 from ..language import LANG_CODEPAGE, LCID_MAP
 from ..models import FileRecord
+from .common import clean_text, decode_bytes, strip_tags
+
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
 def _encint(buf: bytes, pos: int):
@@ -60,7 +69,10 @@ def extract(rec: FileRecord) -> str:
             content_off = struct.unpack("<Q", hdr[0x58:0x60])[0]
         else:
             content_off = dir_off + dir_len
-        entries = _directory(fh, dir_off)
+        try:
+            entries = _directory(fh, dir_off)
+        except (IndexError, struct.error, OSError):
+            entries = {}
 
         lang = LCID_MAP.get(lcid & 0xFFFF, "")
         title = ""
@@ -91,4 +103,56 @@ def extract(rec: FileRecord) -> str:
     if topics:
         rec.pages = len(topics)
         rec.extra["chm_topics"] = str(len(topics))
-    return title
+    body = _page_text(rec, lang)
+    return clean_text(title + "\n" + body)
+
+
+def _page_text(rec: FileRecord, lang: str) -> str:
+    """Decompress the help pages with 7-Zip (bundled) or Windows' hh.exe."""
+    seven = paths.tool("7z")
+    hh = paths.tool("hh") if sys.platform == "win32" else None
+    if not seven and not hh:
+        rec.notes.append("CHM page text needs 7-Zip or hh.exe; used header only")
+        return ""
+    out = tempfile.mkdtemp(prefix="chm_", dir=paths.work_dir())
+    try:
+        if seven:
+            cmd = [seven, "x", "-y", "-o" + out, rec.path, "*.htm", "*.html", "-r"]
+        else:
+            cmd = [hh, "-decompile", out, rec.path]
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=120, creationflags=_NO_WINDOW)
+        except (OSError, subprocess.SubprocessError) as exc:
+            rec.notes.append("CHM extraction failed: %s" % exc.__class__.__name__)
+            return ""
+        pages = []
+        for root, _dirs, files in os.walk(out):
+            for f in files:
+                if f.lower().endswith((".htm", ".html")):
+                    p = os.path.join(root, f)
+                    pages.append((os.path.getsize(p), p))
+        # the largest pages carry the most prose
+        pages.sort(reverse=True)
+        texts, total = [], 0
+        hint = LANG_CODEPAGE.get(lang)
+        for _size, p in pages[:25]:
+            with open(p, "rb") as fh:
+                raw = fh.read(2 * 1024 * 1024)
+            t = strip_tags(decode_bytes(raw, _charset(raw) or hint))
+            texts.append(t)
+            total += len(t)
+            if total > 40000:
+                break
+        return "\n".join(texts)
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def _charset(raw: bytes):
+    import re
+    m = re.search(rb"""charset\s*=\s*["']?([\w\-]+)""", raw[:4096], re.I)
+    if not m:
+        return None
+    cs = m.group(1).decode("ascii", "ignore").lower()
+    return "gb18030" if cs in ("gb2312", "gbk") else cs

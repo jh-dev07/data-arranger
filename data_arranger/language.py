@@ -13,6 +13,32 @@ import re
 from collections import Counter
 from typing import Optional, Tuple
 
+_fasttext_model = None
+_fasttext_failed = False
+
+
+def _fasttext():
+    """fastText lid.176 language-ID model (176 languages), loaded once."""
+    global _fasttext_model, _fasttext_failed
+    if _fasttext_model is not None or _fasttext_failed:
+        return _fasttext_model
+    try:
+        from . import paths
+        path = paths.lid_model_path()
+        if not path:
+            raise FileNotFoundError("lid.176.ftz not found")
+        import fasttext
+        fasttext.FastText.eprint = lambda *a, **k: None   # silence warning
+        _fasttext_model = fasttext.load_model(path)
+    except Exception:
+        _fasttext_failed = True
+    return _fasttext_model
+
+
+def fasttext_available() -> bool:
+    return _fasttext() is not None
+
+
 try:  # optional dependency
     from langdetect import DetectorFactory, detect_langs
     from langdetect.lang_detect_exception import LangDetectException
@@ -178,6 +204,20 @@ def detect_language(text: str, short_ok: bool = False) -> Tuple[str, float]:
 
 
 def _statistical(text: str) -> Tuple[str, float]:
+    model = _fasttext()
+    if model is not None:
+        try:
+            sample = " ".join(text[:6000].split())
+            labels, probs = model.predict(sample, k=1)
+            if labels:
+                code = labels[0].replace("__label__", "")
+                prob = float(probs[0])
+                if code.startswith("zh"):
+                    code = "zh"
+                if prob >= 0.4:
+                    return code, prob
+        except Exception:
+            pass
     if _HAVE_LANGDETECT:
         try:
             results = detect_langs(text[:5000])

@@ -22,7 +22,8 @@ COLUMNS = [
 ]
 COL_STATUS, COL_SIZE = 0, 11
 
-_STATUS_COLORS = {"Done": "#2e7d32", "Error": "#c62828", "Skipped": "#9e9e9e"}
+_STATUS_COLORS = {"Done": "#2e7d32", "Error": "#c62828", "Skipped": "#9e9e9e",
+                  "Needs review": "#e65100"}
 
 
 def human_size(n: int) -> str:
@@ -57,8 +58,11 @@ class RecordModel(QAbstractTableModel):
         if role == Qt.DisplayRole:
             return COLUMNS[col][1](rec)
         if role == Qt.ToolTipRole:
-            if col == COL_STATUS and rec.notes:
-                return "\n".join(rec.notes)
+            if col == COL_STATUS and (rec.notes or rec.review):
+                parts = []
+                if rec.review:
+                    parts.append("Please check: " + ", ".join(rec.review))
+                return "\n".join(parts + rec.notes)
             if col == 5 and rec.doc_type_reasons:
                 return "Confidence %.0f%%\n%s" % (rec.doc_type_confidence * 100,
                                                   "\n".join(rec.doc_type_reasons))
@@ -108,9 +112,12 @@ class FilterProxy(QSortFilterProxyModel):
         self.category = ""
         self.doc_type = ""
         self.language = ""
+        self.review_only = False
         self.setSortRole(Qt.UserRole)
 
-    def set_filters(self, text=None, category=None, doc_type=None, language=None):
+    def set_filters(self, text=None, category=None, doc_type=None, language=None, review_only=None):
+        if review_only is not None:
+            self.review_only = review_only
         if text is not None:
             self.text = text.lower()
         if category is not None:
@@ -123,6 +130,8 @@ class FilterProxy(QSortFilterProxyModel):
 
     def filterAcceptsRow(self, row, parent):
         rec = self.sourceModel().records[row]
+        if self.review_only and not rec.review:
+            return False
         if self.category and rec.category != self.category:
             return False
         if self.doc_type and rec.doc_type != self.doc_type:

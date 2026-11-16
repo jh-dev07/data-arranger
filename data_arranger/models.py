@@ -34,7 +34,7 @@ CATALOG_FIELDS = [
     "volume", "issue", "pages", "journal", "conference", "institution",
     "degree", "patent_number", "standard_number",
     "duration", "width", "height", "artist", "album",
-    "metadata_sources", "notes",
+    "metadata_sources", "review", "notes",
 ]
 
 
@@ -87,6 +87,7 @@ class FileRecord:
     metadata_sources: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
+    review: List[str] = field(default_factory=list)   # reasons to double-check
     destination: str = ""
     status: str = "Pending"
 
@@ -113,9 +114,14 @@ class FileRecord:
             if not value:
                 return False
         setattr(self, attr, value)
+        if source:
+            self.extra["field_src_" + attr] = source
         if source and source not in self.metadata_sources:
             self.metadata_sources.append(source)
         return True
+
+    def source_of(self, attr: str) -> str:
+        return self.extra.get("field_src_" + attr, "")
 
     def to_row(self) -> Dict[str, str]:
         d = asdict(self)

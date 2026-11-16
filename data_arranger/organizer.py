@@ -23,7 +23,7 @@ class Settings:
     output_root: str = ""
     mode: str = "copy"                       # "copy" or "move"
     doc_template: str = "{category}/{doctype}/{language}"
-    media_template: str = "{category}/{language}"
+    media_template: str = "{category}/{format}"
     other_template: str = "{category}/{ext}"
     rename: bool = False
     rename_template: str = "{year} - {authors} - {title}"
