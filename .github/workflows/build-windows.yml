@@ -82,6 +82,17 @@ jobs:
           Copy-Item -Recurse tools dist\DataArranger\tools
           Copy-Item README.md dist\DataArranger\
 
+      - name: Diagnose llama.cpp loading (source vs packaged)
+        if: always()
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          python -m data_arranger --diag-llm diag_src.txt
+          Write-Host "===== from source ====="; Get-Content diag_src.txt -Encoding UTF8
+          $p = Start-Process -FilePath dist\DataArranger\DataArranger.exe -ArgumentList "--diag-llm", "$PWD\diag_exe.txt" -PassThru
+          $p | Wait-Process -Timeout 300 -ErrorAction SilentlyContinue
+          Write-Host "===== packaged exe ====="; if (Test-Path diag_exe.txt) { Get-Content diag_exe.txt -Encoding UTF8 }
+
       - name: Self-test the built exe
         shell: pwsh
         timeout-minutes: 25

@@ -22,6 +22,9 @@ def main():
     import logging
     logging.getLogger(__name__).info("start %s frozen=%s argv=%s", sys.executable,
                                      getattr(sys, "frozen", False), sys.argv[1:])
+    if len(sys.argv) >= 2 and sys.argv[1] == "--diag-llm":
+        from .diag import run as diag
+        return diag(sys.argv[2] if len(sys.argv) > 2 else os.path.abspath("diag_llm.txt"))
     if len(sys.argv) >= 2 and sys.argv[1] == "--selftest":
         from .selftest import run
         out = sys.argv[2] if len(sys.argv) > 2 else os.path.abspath("selftest_result.json")
