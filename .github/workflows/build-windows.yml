@@ -81,6 +81,22 @@ jobs:
           Copy-Item -Recurse models dist\DataArranger\models
           Copy-Item -Recurse tools dist\DataArranger\tools
           Copy-Item README.md dist\DataArranger\
+          # PyQt5 ships an old MSVC C++ runtime; llama.cpp (built with VS 2022)
+          # crashes with it (access violation in std::mutex). Replace every bundled
+          # copy with the current, backward-compatible runtime from Windows.
+          $names = "msvcp140.dll","msvcp140_1.dll","msvcp140_2.dll","msvcp140_atomic_wait.dll","msvcp140_codecvt_ids.dll","vcruntime140.dll","vcruntime140_1.dll","concrt140.dll","vcomp140.dll"
+          Write-Host "Before:"
+          Get-ChildItem dist\DataArranger\_internal -Recurse -Include $names | ForEach-Object { "{0}  {1}" -f $_.FullName, $_.VersionInfo.FileVersion }
+          Get-ChildItem dist\DataArranger\_internal -Recurse -Include $names | ForEach-Object {
+            $src = Join-Path $env:WINDIR ("System32\" + $_.Name)
+            if (Test-Path $src) { Copy-Item $src $_.FullName -Force }
+          }
+          foreach ($n in $names) {
+            $dst = "dist\DataArranger\_internal\$n"; $src = Join-Path $env:WINDIR "System32\$n"
+            if ((Test-Path $src) -and -not (Test-Path $dst)) { Copy-Item $src $dst }
+          }
+          Write-Host "After:"
+          Get-ChildItem dist\DataArranger\_internal -Recurse -Include $names | ForEach-Object { "{0}  {1}" -f $_.FullName, $_.VersionInfo.FileVersion }
 
       - name: Diagnose llama.cpp loading (source vs packaged)
         if: always()
