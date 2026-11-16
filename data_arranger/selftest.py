@@ -78,6 +78,31 @@ def _make_docx(path):
                    "".join("<w:p><w:r><w:t>%s</w:t></w:r></w:p>" % l for l in body.splitlines()))
 
 
+def _make_epub(path):
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("mimetype", "application/epub+zip")
+        z.writestr("META-INF/container.xml",
+                   '<container><rootfiles><rootfile full-path="OEBPS/c.opf"/></rootfiles></container>')
+        z.writestr("OEBPS/c.opf", (
+            '<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata>'
+            '<dc:title>Les Misérables</dc:title><dc:creator>Victor Hugo</dc:creator>'
+            '<dc:language>fr</dc:language><dc:publisher>Gallimard</dc:publisher>'
+            '<dc:identifier>urn:isbn:9782070409228</dc:identifier></metadata>'
+            '<manifest><item id="c1" href="c1.xhtml"/></manifest><spine><itemref idref="c1"/></spine></package>'))
+        z.writestr("OEBPS/c1.xhtml", "<html><body><p>%s</p></body></html>" % (
+            "Il était une fois un homme qui ne savait pas où aller dans la ville et qui marchait. " * 6))
+
+
+def _make_html(path):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('<html lang="en"><head><meta charset="utf-8"><title>Article</title>'
+                 '<meta name="citation_title" content="A Study of River Sediments">'
+                 '<meta name="citation_author" content="Ann Lee">'
+                 '<meta name="citation_journal_title" content="Water Research">'
+                 '<meta name="citation_doi" content="10.1016/j.watres.2020.115000"></head>'
+                 '<body><p>Full text available to subscribers.</p></body></html>')
+
+
 def run(report_path: str) -> int:
     from . import analyzer, isolation, organizer, scanner
     from .capabilities import capabilities
@@ -91,6 +116,8 @@ def run(report_path: str) -> int:
         _make_pdf(os.path.join(src, "paper.pdf"), EN_PAPER)
         _make_pdf(os.path.join(src, "scan_thesis.pdf"), ZH_THESIS, scanned=True)
         _make_docx(os.path.join(src, "report.docx"))
+        _make_epub(os.path.join(src, "book.epub"))
+        _make_html(os.path.join(src, "article.html"))
         with open(os.path.join(src, "song.mp3"), "wb") as fh:
             fh.write(b"ID3\x03\x00\x00\x00\x00\x00\x00")
 
@@ -122,6 +149,11 @@ def run(report_path: str) -> int:
             "scan_type": scan.doc_type == "Dissertation-Thesis",
             "docx_title": docx.title == "Annual Water Quality Report 2022",
             "docx_type": docx.doc_type == "Report",
+            "epub_title_kept": by["book.epub"].title == "Les Misérables",
+            "epub_type": by["book.epub"].doc_type == "Book",
+            "epub_language": by["book.epub"].language == "fr",
+            "html_type": by["article.html"].doc_type == "Journal Article",
+            "media_no_language": by["song.mp3"].language == "",
             "ml_model_used": any("ML model" in r.metadata_sources for r in recs),
         }
         out = os.path.join(tmp, "out")

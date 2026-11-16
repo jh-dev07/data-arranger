@@ -18,17 +18,21 @@ from .models import CAT_DOCUMENT, FileRecord
 log = logging.getLogger(__name__)
 
 MIN_CONTENT_CHARS = 200
+MIN_ML_CHARS = 150          # the model isn't asked about near-empty documents
+DEFAULT_ML_MODE = "always"
 
 
 @dataclass
 class Options:
     online: bool = False
-    ml_mode: str = "always"     # "always" | "auto" | "off"
+    ml_mode: str = ""           # "always" | "auto" | "off" ("" = DEFAULT_ML_MODE)
     ocr: bool = True
 
 
 def analyze(rec: FileRecord, online: bool = False, options: Options = None) -> FileRecord:
     opts = options or Options(online=online)
+    if not opts.ml_mode:
+        opts.ml_mode = DEFAULT_ML_MODE
     text = ""
     try:
         if rec.is_bundle and rec.ext == "pdg":
@@ -57,7 +61,7 @@ def _document_metadata(rec: FileRecord, text: str, opts: Options) -> None:
     except Exception as exc:
         rec.notes.append("text analysis failed: %s" % exc)
 
-    if opts.ml_mode != "off" and text.strip():
+    if opts.ml_mode != "off" and len(text.strip()) >= MIN_ML_CHARS:
         if opts.ml_mode == "always" or _needs_ml(rec, text):
             _run_ml(rec, text)
 

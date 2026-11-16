@@ -57,6 +57,28 @@ def _clean(v) -> str:
     return " ".join(str(v).split()).strip(" ;,.:")
 
 
+_WEAK_SOURCES = ("", "file name", "folder name", "text", "PDF layout")
+
+
+def _replaceable(rec: FileRecord, field: str, text_norm: str) -> bool:
+    """May the model's value replace the current one?
+
+    Weak sources (file name, text heuristics, layout guesses) may be
+    replaced. Embedded metadata is kept, except PDF info-dictionary values
+    that don't appear in the document (often junk such as "Slide 1").
+    """
+    cur = getattr(rec, field)
+    if not cur:
+        return True
+    src = rec.source_of(field)
+    if src in _WEAK_SOURCES:
+        return True
+    if src.endswith(" info"):
+        values = cur if isinstance(cur, list) else [cur]
+        return not any(in_text(v, text_norm, fuzzy=False) for v in values)
+    return False
+
+
 def _strong(rec: FileRecord, field: str) -> bool:
     """Was this field filled from embedded metadata we trust more than ML?"""
     src = rec.source_of(field)
@@ -83,20 +105,16 @@ def merge(rec: FileRecord, data: Dict, text: str) -> None:
 
     # --- title
     title = _clean(data.get("title"))
-    if title and plausible_title(title) and in_text(title, t):
-        cur_src = rec.source_of("title")
-        cur_ok = rec.title and (in_text(rec.title, t, fuzzy=False) or "table of contents" in cur_src)
-        if not cur_ok or cur_src in ("file name", "folder name", "text", "PDF layout", ""):
-            if norm(title) != norm(rec.title):
-                _set(rec, "title", title)
-                used.append("title")
+    if title and plausible_title(title) and len(title) <= 300 and in_text(title, t):
+        if _replaceable(rec, "title", t) and norm(title) != norm(rec.title):
+            _set(rec, "title", title)
+            used.append("title")
 
     # --- authors
     authors = [a for a in (_clean(x) for x in data.get("authors") or []) if 1 < len(a) < 60]
     verified = [a for a in authors if in_text(a, t, fuzzy=False) or _name_in_text(a, t)]
     if verified and len(verified) >= 0.6 * len(authors):
-        if not rec.authors or not any(in_text(a, t, fuzzy=False) for a in rec.authors) \
-                or rec.source_of("authors") in ("file name", "text", "folder name"):
+        if _replaceable(rec, "authors", t) and verified != rec.authors:
             _set(rec, "authors", verified)
             used.append("authors")
 

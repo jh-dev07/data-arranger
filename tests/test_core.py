@@ -18,6 +18,8 @@ from data_arranger.language import detect_language  # noqa: E402
 from data_arranger.models import (BOOK, DISSERTATION, JOURNAL, PATENT, STANDARD,  # noqa: E402
                                   FileRecord)
 
+analyzer.DEFAULT_ML_MODE = "off"   # rules only here; tests/test_full.py covers the ML model
+
 
 class TempDirCase(unittest.TestCase):
     def setUp(self):
